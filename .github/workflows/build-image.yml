@@ -1,0 +1,138 @@
+name: Build image
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - Dockerfile
+      - .github/workflows/build-image.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-image-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  POSTGRES_USER: calcom
+  POSTGRES_PASSWORD: build-only-password
+  POSTGRES_DB: calendso
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # next build inlines NEXT_PUBLIC_* values, so they cannot come from the server .env.
+      # The website URL uses the webapp placeholder so the Dockerfile and scripts/start.sh rewrite it to the real domain.
+      - name: Write build-time public settings
+        run: |
+          cat > apps/web/.env.production <<'EOF'
+          NEXT_PUBLIC_DISABLE_SIGNUP=true
+          NEXT_PUBLIC_WEBSITE_URL=http://NEXT_PUBLIC_WEBAPP_URL_PLACEHOLDER
+          EOF
+
+      # Same approach as .github/actions/docker-build-and-test: the build gets a live, empty Postgres.
+      - name: Start build database
+        run: |
+          docker network create ci
+          docker run -d --name database --network ci \
+            -e POSTGRES_USER -e POSTGRES_PASSWORD -e POSTGRES_DB \
+            postgres:18
+          until docker exec database pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"; do sleep 2; done
+
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: network=container:database
+
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short,prefix=sha-
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            NEXT_PUBLIC_WEBAPP_URL=http://localhost:3000
+            NEXT_PUBLIC_LICENSE_CONSENT=agree
+            CALCOM_TELEMETRY_DISABLED=1
+            DATABASE_URL=postgresql://${{ env.POSTGRES_USER }}:${{ env.POSTGRES_PASSWORD }}@localhost:5432/${{ env.POSTGRES_DB }}
+
+      - name: Smoke test image
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          image="$(head -n1 <<< "$TAGS")"
+          db_url="postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@database:5432/$POSTGRES_DB"
+          # The empty NEXT_PUBLIC_DISABLE_SIGNUP stands for a server env that does not set it: the build must already have switched sign-up off.
+          docker run -d --name calcom --network ci -p 3000:3000 \
+            -e DATABASE_HOST=database:5432 \
+            -e DATABASE_URL="$db_url" \
+            -e DATABASE_DIRECT_URL="$db_url" \
+            -e NEXTAUTH_SECRET=ci-only-auth-secret \
+            -e CALENDSO_ENCRYPTION_KEY=0123456789abcdef0123456789abcdef \
+            -e NEXT_PUBLIC_DISABLE_SIGNUP= \
+            "$image"
+          healthy=""
+          for i in $(seq 1 90); do
+            code="$(curl -sL --max-time 20 -o /dev/null -w '%{http_code}' http://localhost:3000/auth/login || true)"
+            if [ "$code" = "200" ]; then
+              echo "Healthy after about $((i * 5)) seconds"
+              healthy=1
+              break
+            fi
+            sleep 5
+          done
+          if [ -z "$healthy" ]; then
+            echo "No final HTTP 200 from /auth/login (following redirects; last status: $code)"
+            docker logs --tail 200 calcom
+            exit 1
+          fi
+          signup="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -X POST -H 'Content-Type: application/json' -d '{}' http://localhost:3000/api/auth/signup || true)"
+          if [ "$signup" != "403" ]; then
+            echo "POST /api/auth/signup returned $signup, expected 403: sign-up is not disabled in this image"
+            docker logs --tail 200 calcom
+            exit 1
+          fi
+          echo "Sign-up is disabled (403)"
+
+      - name: Push image
+        if: github.event_name != 'pull_request'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          # The immutable sha- tags go first so an interrupted push never leaves latest without its sha- tag.
+          while read -r tag; do
+            case "$tag" in
+              "" | *:latest) ;;
+              *) docker push "$tag" ;;
+            esac
+          done <<< "$TAGS"
+          while read -r tag; do
+            case "$tag" in
+              *:latest) docker push "$tag" ;;
+            esac
+          done <<< "$TAGS"
