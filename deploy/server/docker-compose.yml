@@ -1,0 +1,52 @@
+# Production stack for one server. Lives at /opt/cal/docker-compose.yml next to /opt/cal/.env.
+name: cal
+
+# Without a limit, json-file logs grow until the disk is full.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  database:
+    image: postgres:18
+    restart: always
+    logging: *default-logging
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - database-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # No ports are published: the only way in from the internet is the Cloudflare tunnel.
+  calcom:
+    image: ghcr.io/3376016376joshua-oss/cal.diy:${CAL_IMAGE_TAG:-latest}
+    # Not "always": after `docker compose stop calcom` (restore procedure) a Docker restart must not start the app on a half-restored database.
+    restart: unless-stopped
+    logging: *default-logging
+    env_file: .env
+    environment:
+      DATABASE_HOST: database:5432
+    depends_on:
+      database:
+        condition: service_healthy
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: always
+    logging: *default-logging
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN}
+    depends_on:
+      - calcom
+
+volumes:
+  database-data:
