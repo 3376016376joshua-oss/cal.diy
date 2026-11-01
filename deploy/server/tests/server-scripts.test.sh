@@ -143,7 +143,9 @@ guard() {
 
 check "bootstrap needs a target" guard "usage: bootstrap.sh" "$server_dir/bootstrap.sh"
 check "bootstrap refuses an empty tunnel token" guard "TUNNEL_TOKEN is empty" env CAL_ENV_FILE="$out" "$server_dir/bootstrap.sh" root@192.0.2.1
-for script in bootstrap.sh make-env.sh; do
+check "migrate-data needs users to keep" guard "usage: migrate-data.sh" "$server_dir/migrate-data.sh" root@192.0.2.1
+check "migrate-data rejects a malformed user list" guard "comma-separated list" "$server_dir/migrate-data.sh" root@192.0.2.1 "42;43"
+for script in bootstrap.sh migrate-data.sh make-env.sh; do
   check "$script is executable" test -x "$server_dir/$script"
   check "$script has valid bash syntax" bash -n "$server_dir/$script"
 done
@@ -161,6 +163,7 @@ body_has_valid_syntax() {
 
 check "bootstrap.sh server script has valid syntax" body_has_valid_syntax bash bootstrap.sh REMOTE
 check "backup.sh (written by bootstrap.sh) has valid syntax" body_has_valid_syntax sh bootstrap.sh BACKUP
+check "migrate-data.sh server script has valid syntax" body_has_valid_syntax bash migrate-data.sh REMOTE
 
 # --- the scripts against a fake server ---
 # The fake ssh runs the remote command locally with /opt/cal moved into $work, the fake docker answers the
@@ -342,6 +345,124 @@ check "bootstrap copies compose file and env (mode 600), no backup when there wa
 check "bootstrap keeps the previous server .env as a mode 600 backup" bootstrap_keeps_the_previous_env
 check "bootstrap stops, without echoing values, when Compose cannot read the env" bootstrap_stops_on_compose_problem
 check "backup names carry the time, so two backups on one day differ" backup_names_have_date_and_time
+
+# <tables already in the server database> <"abc123" if the app container exists, "" if not, "fail" if Compose cannot say>
+#   [users outside the keep list, or "fail" if they cannot be counted; default 0] [1 if deploy.sh has already written the live marker]
+#   [a docker call that fails, as text from its arguments] [users to keep that exist, or "fail" if they cannot be counted; default 2]
+#   [1 if an earlier import left .imported on the server]
+migrate_against_fake() {
+  : > "$docker_log"
+  rm -f "$fake_root/.deployed" "$fake_root/.imported" "$fake_root/backups/initial-import.dump"
+  if [ -n "${4:-}" ]; then
+    echo "2026-10-31T12:00:00Z" > "$fake_root/.deployed"
+  fi
+  if [ -n "${7:-}" ]; then
+    echo "2020-01-01T00:00:00Z" > "$fake_root/.imported"
+  fi
+  run_capture env PATH="$fakes:$PATH" DOCKER_LOG="$docker_log" FAKE_OPT_CAL="$fake_root" FAKE_TABLES="$1" FAKE_APP_CONTAINER="$2" FAKE_USER_COUNT="${6:-2}" \
+    FAKE_OTHER_USERS="${3:-0}" FAKE_DOCKER_FAIL="${5:-}" LOCAL_DB_CONTAINER=fake-local-db "$server_dir/migrate-data.sh" root@192.0.2.1 42,43
+}
+
+show_migrate_run() {
+  echo "  exit status $last_status"
+  sed 's/^/  stderr: /' "$work/stderr"
+  sed 's/^/  docker: /' "$docker_log"
+}
+
+# <app container> <users outside the keep list>
+migrate_refuses_to_reset() {
+  migrate_against_fake 12 "$1" "$2"
+  if [ "$last_status" -eq 1 ] && grep -qF "must NOT be reset" "$work/stderr" && grep -qF "restore a backup" "$work/stderr" \
+    && ! grep -qF "down -v" "$work/stderr" && ! grep -qF "pg_restore" "$docker_log"; then
+    return 0
+  fi
+  show_migrate_run
+  return 1
+}
+
+migrate_offers_reset_before_the_purge() {
+  migrate_against_fake 12 "" 3
+  if [ "$last_status" -eq 1 ] && grep -qF "down -v" "$work/stderr" && grep -qF "deletes all server data" "$work/stderr" \
+    && ! grep -qF "must NOT be reset" "$work/stderr" && ! grep -qF "pg_restore" "$docker_log"; then
+    return 0
+  fi
+  show_migrate_run
+  return 1
+}
+
+migrate_refuses_after_go_live() {
+  migrate_against_fake 0 "" 0 1
+  if [ "$last_status" -eq 1 ] && grep -qF "already started the app" "$work/stderr" && grep -qF "restore a backup" "$work/stderr" \
+    && ! grep -qE 'pg_dump|^docker exec ' "$docker_log" && [ ! -e "$fake_root/backups/initial-import.dump" ]; then
+    return 0
+  fi
+  show_migrate_run
+  return 1
+}
+
+# The Mac-side check normally stops first, so run the server script directly to see its own last line of defence.
+migrate_server_script_checks_the_marker_too() {
+  : > "$docker_log"
+  heredoc_body "$server_dir/migrate-data.sh" REMOTE > "$work/migrate-remote.sh"
+  echo "2026-10-31T12:00:00Z" > "$fake_root/.deployed"
+  run_capture env PATH="$fakes:$PATH" DOCKER_LOG="$docker_log" FAKE_OPT_CAL="$fake_root" FAKE_TABLES=12 FAKE_APP_CONTAINER="" FAKE_USER_COUNT=2 FAKE_OTHER_USERS=3 \
+    "$fakes/ssh" root@192.0.2.1 "KEEP_USER_IDS='42,43' bash -s" < "$work/migrate-remote.sh"
+  rm -f "$fake_root/.deployed"
+  if [ "$last_status" -eq 1 ] && grep -qF "must NOT be reset" "$work/stderr" && ! grep -qF "down -v" "$work/stderr"; then
+    return 0
+  fi
+  show_migrate_run
+  return 1
+}
+
+migrate_stops_when_ssh_fails() {
+  : > "$stub_log"
+  run_capture env PATH="$stubs:$PATH" "$server_dir/migrate-data.sh" root@192.0.2.1 42,43
+  if [ "$last_status" -eq 1 ] && grep -qF "Could not reach" "$work/stderr" && [ "$(grep -c . "$stub_log")" -eq 1 ] && grep -q '^ssh ' "$stub_log"; then
+    return 0
+  fi
+  echo "  exit status $last_status"
+  sed 's/^/  stderr: /' "$work/stderr"
+  sed 's/^/  stub: /' "$stub_log"
+  return 1
+}
+
+migrate_marks_the_import_finished() {
+  migrate_against_fake 0 "" 0 "" "" 2 1
+  if [ "$last_status" -eq 0 ] && grep -qF "delete from users" "$docker_log" \
+    && grep -qxE '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z' "$fake_root/.imported" \
+    && ! grep -qx '2020-01-01T00:00:00Z' "$fake_root/.imported"; then
+    return 0
+  fi
+  show_migrate_run
+  return 1
+}
+
+# An earlier import's .imported is on the server and the database was reset, so only this run can leave a marker.
+# <message the script must print, or "" for none> <docker call that fails> <users to keep that exist> <text in the docker log that shows the script got that far>
+migrate_import_leaves_no_marker() {
+  migrate_against_fake 0 "" 0 "" "$2" "$3" 1
+  if [ "$last_status" -eq 1 ] && { [ -z "$1" ] || grep -qF "$1" "$work/stderr"; } && grep -qF "$4" "$docker_log" && [ ! -e "$fake_root/.imported" ]; then
+    return 0
+  fi
+  show_migrate_run
+  echo "  .imported exists: $([ -e "$fake_root/.imported" ] && echo yes || echo no)"
+  return 1
+}
+
+check "migrate-data refuses once deploy.sh has started the app, before dumping anything" migrate_refuses_after_go_live
+check "migrate-data's server script also stops on the live marker" migrate_server_script_checks_the_marker_too
+check "migrate-data stops when it cannot ask the server" migrate_stops_when_ssh_fails
+check "migrate-data says do not reset once the app container exists" migrate_refuses_to_reset abc123 3
+check "migrate-data says do not reset when Compose cannot tell" migrate_refuses_to_reset fail 3
+check "migrate-data says do not reset after the purge, with no container left" migrate_refuses_to_reset "" 0
+check "migrate-data says do not reset when the other users cannot be counted" migrate_refuses_to_reset "" fail
+check "migrate-data offers the reset only while seed accounts remain and the app never ran" migrate_offers_reset_before_the_purge
+check "migrate-data writes .imported (a fresh UTC time) once the other users are deleted" migrate_marks_the_import_finished
+check "migrate-data leaves no .imported, old ones included, when the users to keep are not all there" migrate_import_leaves_no_marker "Only 1 of the 2 users to keep exist" "" 1 "where id in (42,43)"
+check "migrate-data leaves no .imported when the users to keep cannot be counted" migrate_import_leaves_no_marker "Could not count the users to keep" "" fail "where id in (42,43)"
+check "migrate-data leaves no .imported when deleting the other users fails" migrate_import_leaves_no_marker "Deleting the other users failed" "delete from users" 2 "delete from users"
+check "migrate-data leaves no .imported when the restore fails" migrate_import_leaves_no_marker "" "pg_restore" 2 "pg_restore"
 
 # --- the fake ssh itself ---
 # <remote command the fake must refuse, and which would create $work/ssh-ran if it ran>
