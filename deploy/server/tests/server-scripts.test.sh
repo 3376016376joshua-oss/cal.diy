@@ -145,7 +145,10 @@ check "bootstrap needs a target" guard "usage: bootstrap.sh" "$server_dir/bootst
 check "bootstrap refuses an empty tunnel token" guard "TUNNEL_TOKEN is empty" env CAL_ENV_FILE="$out" "$server_dir/bootstrap.sh" root@192.0.2.1
 check "migrate-data needs users to keep" guard "usage: migrate-data.sh" "$server_dir/migrate-data.sh" root@192.0.2.1
 check "migrate-data rejects a malformed user list" guard "comma-separated list" "$server_dir/migrate-data.sh" root@192.0.2.1 "42;43"
-for script in bootstrap.sh migrate-data.sh make-env.sh; do
+check "deploy needs a target" guard "usage: deploy.sh" "$server_dir/deploy.sh"
+check "deploy rejects an unsafe image tag" guard "Invalid image tag" env CAL_ENV_FILE="$out" "$server_dir/deploy.sh" root@192.0.2.1 'latest;reboot'
+check "pull-backup needs a target" guard "usage: pull-backup.sh" "$server_dir/pull-backup.sh"
+for script in bootstrap.sh migrate-data.sh deploy.sh pull-backup.sh make-env.sh; do
   check "$script is executable" test -x "$server_dir/$script"
   check "$script has valid bash syntax" bash -n "$server_dir/$script"
 done
@@ -164,6 +167,7 @@ body_has_valid_syntax() {
 check "bootstrap.sh server script has valid syntax" body_has_valid_syntax bash bootstrap.sh REMOTE
 check "backup.sh (written by bootstrap.sh) has valid syntax" body_has_valid_syntax sh bootstrap.sh BACKUP
 check "migrate-data.sh server script has valid syntax" body_has_valid_syntax bash migrate-data.sh REMOTE
+check "deploy.sh server script has valid syntax" body_has_valid_syntax bash deploy.sh REMOTE
 
 # --- the scripts against a fake server ---
 # The fake ssh runs the remote command locally with /opt/cal moved into $work, the fake docker answers the
@@ -463,6 +467,138 @@ check "migrate-data leaves no .imported, old ones included, when the users to ke
 check "migrate-data leaves no .imported when the users to keep cannot be counted" migrate_import_leaves_no_marker "Could not count the users to keep" "" fail "where id in (42,43)"
 check "migrate-data leaves no .imported when deleting the other users fails" migrate_import_leaves_no_marker "Deleting the other users failed" "delete from users" 2 "delete from users"
 check "migrate-data leaves no .imported when the restore fails" migrate_import_leaves_no_marker "" "pg_restore" 2 "pg_restore"
+
+# <markers the server already has: "imported" and/or "deployed"; none for a server where migrate-data.sh has not finished>
+fake_server_has() {
+  rm -f "$fake_root/.imported" "$fake_root/.deployed"
+  for marker in "$@"; do
+    echo "2026-10-31T12:00:00Z" > "$fake_root/.$marker"
+  done
+}
+
+# <user count the database reports, or "fail"> [image tag] [a docker call that fails, as text from its arguments]
+deploy_against_fake() {
+  : > "$docker_log"
+  run_capture env PATH="$fakes:$PATH" DOCKER_LOG="$docker_log" FAKE_OPT_CAL="$fake_root" FAKE_USER_COUNT="$1" FAKE_DOCKER_FAIL="${3:-}" CAL_ENV_FILE="$out" \
+    "$server_dir/deploy.sh" root@192.0.2.1 ${2:+"$2"}
+}
+
+show_deploy_run() {
+  echo "  exit status $last_status"
+  sed 's/^/  stderr: /' "$work/stderr"
+  sed 's/^/  docker: /' "$docker_log"
+}
+
+deploy_refuses_before_the_import_has_finished() {
+  fake_server_has
+  deploy_against_fake 2
+  if [ "$last_status" -eq 1 ] \
+    && grep -qF "The data import has not finished" "$work/stderr" \
+    && grep -qF "migrate-data.sh <ssh-target> 42,43" "$work/stderr" \
+    && grep -qF "ssh <ssh-target> touch " "$work/stderr" \
+    && [ ! -s "$docker_log" ] \
+    && [ ! -e "$fake_root/.deployed" ]; then
+    return 0
+  fi
+  show_deploy_run
+  return 1
+}
+
+# <markers the server has: "imported" or "deployed">
+deploy_starts_app_with_marker() {
+  fake_server_has "$1"
+  deploy_against_fake 2
+  if [ "$last_status" -eq 0 ] \
+    && grep -qF "compose pull" "$docker_log" \
+    && grep -qF "compose up -d --remove-orphans" "$docker_log"; then
+    return 0
+  fi
+  show_deploy_run
+  return 1
+}
+
+deploy_refuses_empty_database() {
+  fake_server_has imported
+  deploy_against_fake "$1"
+  if [ "$last_status" -eq 1 ] \
+    && grep -qF "has no accounts" "$work/stderr" \
+    && grep -qF "compose up -d --wait database" "$docker_log" \
+    && ! grep -qE 'compose (pull|up -d --remove-orphans)' "$docker_log" \
+    && [ ! -e "$fake_root/.deployed" ]; then
+    return 0
+  fi
+  show_deploy_run
+  return 1
+}
+
+deploy_starts_app_with_accounts() {
+  fake_server_has imported
+  deploy_against_fake 2 sha-1a2b3c4
+  if [ "$last_status" -eq 0 ] \
+    && grep -qF "compose pull [tag=sha-1a2b3c4]" "$docker_log" \
+    && grep -qF "compose up -d --remove-orphans [tag=sha-1a2b3c4]" "$docker_log" \
+    && grep -qF "image prune -f" "$docker_log"; then
+    return 0
+  fi
+  show_deploy_run
+  return 1
+}
+
+deploy_writes_the_live_marker() {
+  fake_server_has imported
+  deploy_against_fake 2
+  if [ "$last_status" -eq 0 ] && grep -qxE '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z' "$fake_root/.deployed"; then
+    return 0
+  fi
+  show_deploy_run
+  return 1
+}
+
+deploy_keeps_the_first_marker() {
+  fake_server_has imported
+  echo "2026-01-01T00:00:00Z" > "$fake_root/.deployed"
+  deploy_against_fake 2
+  if [ "$last_status" -eq 0 ] && [ "$(cat "$fake_root/.deployed")" = "2026-01-01T00:00:00Z" ]; then
+    return 0
+  fi
+  show_deploy_run
+  return 1
+}
+
+# <a docker call that fails>
+deploy_writes_no_marker_when_it_fails() {
+  fake_server_has imported
+  deploy_against_fake 2 "" "$1"
+  if [ "$last_status" -eq 1 ] && grep -qF "$1" "$docker_log" && [ ! -e "$fake_root/.deployed" ]; then
+    return 0
+  fi
+  show_deploy_run
+  return 1
+}
+
+check "deploy does not start the app before the import has finished, even when the database has accounts" deploy_refuses_before_the_import_has_finished
+check "deploy starts the app with only .imported (the import finished)" deploy_starts_app_with_marker imported
+check "deploy starts the app with only .deployed (the site is already live)" deploy_starts_app_with_marker deployed
+check "deploy does not start the app on a database with 0 users" deploy_refuses_empty_database 0
+check "deploy does not start the app when the users cannot be counted" deploy_refuses_empty_database fail
+check "deploy starts the app, with the tag, once the database has users" deploy_starts_app_with_accounts
+check "deploy writes .deployed (a UTC time) after the app is up" deploy_writes_the_live_marker
+check "deploy keeps the time of the first deploy in .deployed" deploy_keeps_the_first_marker
+check "deploy writes no .deployed when the image pull fails" deploy_writes_no_marker_when_it_fails "compose pull"
+check "deploy writes no .deployed when starting the app fails" deploy_writes_no_marker_when_it_fails "compose up -d --remove-orphans"
+
+pull_backup_picks_newest_dump() {
+  local dest="$work/pulled"
+  touch -t 202610300300 "$fake_root/backups/cal-2026-10-30-030000.dump"
+  touch -t 202610310300 "$fake_root/backups/cal-2026-10-31-030000.dump"
+  touch -t 202610311415 "$fake_root/backups/cal-2026-10-31-141500.dump"
+  touch -t 202610311500 "$fake_root/backups/cal-2026-10-31-150000.dump.partial"
+  touch -t 202610311600 "$fake_root/backups/initial-import.dump"
+  run_capture env PATH="$fakes:$PATH" FAKE_OPT_CAL="$fake_root" CAL_BACKUP_DIR="$dest" "$server_dir/pull-backup.sh" root@192.0.2.1
+  [ "$last_status" -eq 0 ] && [ "$(ls "$dest")" = "cal-2026-10-31-141500.dump" ]
+}
+
+check "pull-backup picks the newest dated dump, not partial or import files" pull_backup_picks_newest_dump
 
 # --- the fake ssh itself ---
 # <remote command the fake must refuse, and which would create $work/ssh-ran if it ran>
