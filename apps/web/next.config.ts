@@ -1,9 +1,10 @@
+import process from "node:process";
+import i18nConfig from "@calcom/i18n/next-i18next.config";
 import { withBotId } from "botid/next/config";
 import { config as dotenvConfig } from "dotenv";
 import type { NextConfig } from "next";
 import type { RouteHas } from "next/dist/lib/load-custom-routes";
 import { withAxiom } from "next-axiom";
-import i18nConfig from "@calcom/i18n/next-i18next.config";
 import packageJson from "./package.json";
 import {
   nextJsOrgRewriteConfig,
@@ -223,6 +224,10 @@ const nextConfig = (phase: string): NextConfig => {
 
   return {
     output: process.env.BUILD_STANDALONE === "true" ? "standalone" : undefined,
+    // Next 16 blocks dev assets on non-localhost origins, which breaks the dev server behind a tunnel
+    allowedDevOrigins: process.env.NEXT_PUBLIC_WEBAPP_URL
+      ? [new URL(process.env.NEXT_PUBLIC_WEBAPP_URL).hostname]
+      : undefined,
     serverExternalPackages: [
       "deasync",
       "http-cookie-agent",
