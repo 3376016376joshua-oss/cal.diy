@@ -1,0 +1,32 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "web",
+      "runtimeExecutable": "/bin/sh",
+      "runtimeArgs": [
+        "-c",
+        "PATH=/opt/homebrew/opt/node@22/bin:$PATH NODE_OPTIONS=--max-old-space-size=8192 exec node .yarn/releases/yarn-4.12.0.cjs workspace @calcom/web dev -p 3100"
+      ],
+      "port": 3100
+    },
+    {
+      "name": "web-local",
+      "runtimeExecutable": "/bin/sh",
+      "runtimeArgs": [
+        "-c",
+        "PATH=/opt/homebrew/opt/node@22/bin:$PATH NODE_OPTIONS=--max-old-space-size=8192 NEXT_PUBLIC_WEBAPP_URL=http://localhost:3100 NEXT_PUBLIC_WEBSITE_URL=http://localhost:3100 NEXTAUTH_URL=http://localhost:3100 exec node .yarn/releases/yarn-4.12.0.cjs workspace @calcom/web dev -p 3100"
+      ],
+      "port": 3100
+    },
+    {
+      "name": "web-prod",
+      "runtimeExecutable": "/bin/sh",
+      "runtimeArgs": [
+        "-c",
+        "PATH=/opt/homebrew/opt/node@22/bin:$PATH exec node .yarn/releases/yarn-4.12.0.cjs workspace @calcom/web start -p 3100"
+      ],
+      "port": 3100
+    }
+  ]
+}
